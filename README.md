@@ -19,6 +19,30 @@ Internet → ALB (HTTPS) → ECS Fargate
 
 ---
 
+## Using the fastapi/full-stack-fastapi-template
+
+The infrastructure is wired for the [fastapi/full-stack-fastapi-template](https://github.com/fastapi/full-stack-fastapi-template). To replace the stubs with the real app:
+
+```bash
+git clone https://github.com/fastapi/full-stack-fastapi-template _template
+
+# Backend
+cp -r _template/backend/*        app/backend/
+cp    _template/uv.lock          app/
+cp    _template/pyproject.toml   app/
+
+# Frontend
+cp -r _template/frontend/*       app/frontend/
+cp    _template/bun.lock         app/
+cp    _template/package.json     app/
+
+rm -rf _template
+```
+
+The Dockerfiles, docker-compose, and Terraform are already configured for the template's env var names (`POSTGRES_SERVER`, `SECRET_KEY`, etc.) — no further infra changes needed.
+
+---
+
 ## Local Development
 
 Run the full stack locally with Docker Compose — no AWS account needed:
@@ -122,6 +146,7 @@ In your repo → Settings → Secrets and variables → Actions, add:
 | `TF_BACKEND_DYNAMODB_TABLE` | `tf-locks-ecs-fullstack` |
 | `BACKEND_ECR_REPO` | Output of `terraform output backend_ecr_url` (repo name only, without registry prefix) |
 | `FRONTEND_ECR_REPO` | Output of `terraform output frontend_ecr_url` (repo name only) |
+| `DOMAIN_NAME` | Your domain (e.g. `example.com`) — baked into the frontend as `VITE_API_URL` at build time |
 
 ---
 

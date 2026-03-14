@@ -1,0 +1,167 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Terraform workspace (dev or prod)"
+        required: false
+        default: "dev"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  # ── Build backend ────────────────────────────────────────────────────────────
+  build-backend:
+    name: Build & Push Backend
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push backend image
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ secrets.BACKEND_ECR_REPO }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          # Build context is ./app — Dockerfile references workspace uv.lock at that level
+          docker build -t "${IMAGE_URI}" --file ./app/backend/Dockerfile ./app
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ── Build frontend ───────────────────────────────────────────────────────────
+  build-frontend:
+    name: Build & Push Frontend
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push frontend image
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ secrets.FRONTEND_ECR_REPO }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          # Build context is ./app — Dockerfile references workspace bun.lock at that level.
+          # VITE_API_URL is baked in at build time (Vite replaces import.meta.env.VITE_API_URL).
+          docker build \
+            --build-arg VITE_API_URL="https://api.${{ secrets.DOMAIN_NAME }}" \
+            --file ./app/frontend/Dockerfile \
+            --tag "${IMAGE_URI}" \
+            ./app
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ── Terraform deploy ─────────────────────────────────────────────────────────
+  deploy:
+    name: Terraform Deploy
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend]
+    env:
+      TF_VAR_backend_image: ${{ needs.build-backend.outputs.image_uri }}
+      TF_VAR_frontend_image: ${{ needs.build-frontend.outputs.image_uri }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Select / create workspace
+        working-directory: terraform
+        env:
+          TF_WORKSPACE: ${{ github.event.inputs.workspace || 'dev' }}
+        run: |
+          terraform workspace select "${TF_WORKSPACE}" \
+            || terraform workspace new "${TF_WORKSPACE}"
+
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          TF_WORKSPACE: ${{ github.event.inputs.workspace || 'dev' }}
+        run: |
+          TFVARS_FILE="terraform.tfvars"
+          if [[ "${TF_WORKSPACE}" == "prod" ]]; then
+            TFVARS_FILE="terraform.prod.tfvars"
+          fi
+          terraform plan \
+            -var-file="${TFVARS_FILE}" \
+            -out=tfplan
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Read cluster and service names from Terraform outputs
+        id: tf-outputs
+        working-directory: terraform
+        run: |
+          echo "cluster_name=$(terraform output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+          echo "backend_service=$(terraform output -raw backend_service_name)" >> "$GITHUB_OUTPUT"
+          echo "frontend_service=$(terraform output -raw frontend_service_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ECS services to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.tf-outputs.outputs.cluster_name }}" \
+            --services \
+              "${{ steps.tf-outputs.outputs.backend_service }}" \
+              "${{ steps.tf-outputs.outputs.frontend_service }}"
