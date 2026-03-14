@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: devpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./app       # workspace root — uv.lock lives here
+      dockerfile: backend/Dockerfile
+    command: fastapi dev --reload --host 0.0.0.0 --port 8000 app/main.py
+    working_dir: /app/backend
+    volumes:
+      - ./app/backend/app:/app/backend/app  # hot reload
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: app
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: devpassword
+      SECRET_KEY: changethis
+      FIRST_SUPERUSER: admin@example.com
+      FIRST_SUPERUSER_PASSWORD: changethis
+      ENVIRONMENT: local
+      BACKEND_CORS_ORIGINS: "http://localhost:5173,http://localhost"
+      DOMAIN: localhost
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./app       # workspace root — bun.lock lives here
+      dockerfile: frontend/Dockerfile
+      target: build-stage
+    command: bun run dev --host 0.0.0.0 --port 5173
+    working_dir: /app/frontend
+    volumes:
+      - ./app/frontend/src:/app/frontend/src  # hot reload
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
