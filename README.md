@@ -1,21 +1,42 @@
 # aws-ecs-fullstack
 
-Production-ready AWS ECS deployment for a FastAPI + React/Vite + PostgreSQL stack, fully managed by Terraform and deployed via GitHub Actions.
+Production-ready AWS infrastructure for a FastAPI + React/Vite + PostgreSQL stack. Supports two deployment targets — **ECS Fargate** (default, simpler) and **EKS** (Kubernetes, production-scale) — both fully managed by Terraform and deployed via GitHub Actions with OIDC.
 
 ## Architecture
 
+### ECS (default)
 ```
 Internet → ALB (HTTPS) → ECS Fargate
                             ├── Frontend (Nginx/React) — port 80
-                            └── Backend  (FastAPI)     — port 8000  → RDS PostgreSQL (isolated subnets)
+                            └── Backend  (FastAPI)     — port 8000  → RDS PostgreSQL
 ```
 
-- **Networking**: VPC with public / private / isolated subnets across 3 AZs, NAT Gateways, VPC endpoints for ECR, S3, Secrets Manager, and CloudWatch Logs
-- **Compute**: ECS Fargate with CPU + memory auto-scaling
-- **Database**: RDS PostgreSQL 16 (encrypted, gp3, credentials in Secrets Manager)
-- **TLS**: ACM certificate with DNS validation; HTTP→HTTPS 301 redirect
-- **CI/CD**: GitHub Actions with OIDC (no long-lived AWS keys)
-- **Observability**: CloudWatch alarms for CPU, unhealthy hosts, and RDS free storage
+### EKS (`enable_eks = true`)
+```
+Internet → ALB (HTTPS, via LBC) → EKS Managed Node Group
+                                      ├── frontend pods  (Nginx/React)
+                                      └── backend pods   (FastAPI)  → RDS PostgreSQL
+                                                                        ↑
+                                              External Secrets Operator syncs
+                                              Secrets Manager → K8s secrets
+```
+
+| Component | ECS | EKS |
+|---|---|---|
+| Compute | Fargate (serverless) | Managed node group (EC2) |
+| Scaling | App Autoscaling (CPU/mem) | HPA + Cluster Autoscaler |
+| Secrets | Secrets Manager `::key::` injection | External Secrets Operator |
+| Ingress | ALB (Terraform-managed) | ALB via AWS Load Balancer Controller |
+| Packaging | Task definitions | Helm chart (`helm/fullstack/`) |
+| Deploy workflow | `deploy.yml` | `deploy-eks.yml` |
+
+**Shared across both:**
+- VPC — 3 AZs, public / private / isolated subnets, NAT Gateways, VPC endpoints
+- ECR — immutable image tags, lifecycle policies
+- RDS PostgreSQL 16 — encrypted gp3, Secrets Manager, Multi-AZ in prod
+- ACM certificate — DNS validation, HTTP→HTTPS redirect
+- IAM — OIDC for GitHub Actions (no long-lived keys)
+- CloudWatch — alarms for CPU, unhealthy hosts, RDS free storage
 
 ---
 
@@ -26,15 +47,13 @@ The infrastructure is wired for the [fastapi/full-stack-fastapi-template](https:
 ```bash
 git clone https://github.com/fastapi/full-stack-fastapi-template _template
 
-# Backend
-cp -r _template/backend/*        app/backend/
-cp    _template/uv.lock          app/
-cp    _template/pyproject.toml   app/
+cp -r _template/backend/*      app/backend/
+cp    _template/uv.lock        app/
+cp    _template/pyproject.toml app/
 
-# Frontend
-cp -r _template/frontend/*       app/frontend/
-cp    _template/bun.lock         app/
-cp    _template/package.json     app/
+cp -r _template/frontend/*     app/frontend/
+cp    _template/bun.lock       app/
+cp    _template/package.json   app/
 
 rm -rf _template
 ```
@@ -73,16 +92,15 @@ docker compose down -v
 - AWS CLI v2 + credentials with admin access (bootstrap only)
 - Terraform `~> 1.9`
 - Docker
-- A registered domain (or use `example.com` as a placeholder — ACM cert validation will pend)
+- A registered domain (or use `example.com` as a placeholder — ACM cert will pend validation)
 - A GitHub repository in your org
+- **EKS only:** `kubectl` and `helm` (v3)
 
 ---
 
 ## First-Time Setup
 
 ### 1. Bootstrap state backend (manual, one-time)
-
-Create the S3 bucket and DynamoDB table for Terraform state:
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -108,12 +126,15 @@ aws dynamodb create-table \
 
 ### 2. Update tfvars
 
-Edit `terraform/terraform.tfvars` (and `terraform.prod.tfvars` for prod):
+Edit `terraform/terraform.tfvars`:
 
 ```hcl
 github_org  = "your-org"
 github_repo = "aws-ecs-fullstack"
-domain_name = "your-domain.com"   # or leave as example.com
+domain_name = "your-domain.com"
+
+# Set true to also provision an EKS cluster
+enable_eks = false
 ```
 
 ### 3. First apply (creates OIDC provider + roles)
@@ -132,38 +153,49 @@ terraform plan -var-file=terraform.tfvars
 terraform apply -var-file=terraform.tfvars
 ```
 
-After the first apply, set `create_github_oidc_provider = false` to avoid conflicts on subsequent runs.
+After the first apply, set `create_github_oidc_provider = false` to avoid conflicts on re-runs.
 
 ### 4. Populate GitHub Actions secrets
 
-In your repo → Settings → Secrets and variables → Actions, add:
+In your repo → Settings → Secrets and variables → Actions:
 
-| Secret | Value |
-|---|---|
-| `AWS_ROLE_ARN` | Output of `terraform output github_actions_role_arn` |
-| `AWS_REGION` | e.g. `us-east-1` |
-| `TF_BACKEND_BUCKET` | The S3 bucket name from step 1 |
-| `TF_BACKEND_DYNAMODB_TABLE` | `tf-locks-ecs-fullstack` |
-| `BACKEND_ECR_REPO` | Output of `terraform output backend_ecr_url` (repo name only, without registry prefix) |
-| `FRONTEND_ECR_REPO` | Output of `terraform output frontend_ecr_url` (repo name only) |
-| `DOMAIN_NAME` | Your domain (e.g. `example.com`) — baked into the frontend as `VITE_API_URL` at build time |
+| Secret | Value | Required for |
+|---|---|---|
+| `AWS_ROLE_ARN` | `terraform output github_actions_role_arn` | ECS + EKS |
+| `AWS_REGION` | e.g. `us-east-1` | ECS + EKS |
+| `TF_BACKEND_BUCKET` | S3 bucket name from step 1 | ECS + EKS |
+| `TF_BACKEND_DYNAMODB_TABLE` | `tf-locks-ecs-fullstack` | ECS + EKS |
+| `BACKEND_ECR_REPO` | `terraform output backend_ecr_url` (repo name only) | ECS + EKS |
+| `FRONTEND_ECR_REPO` | `terraform output frontend_ecr_url` (repo name only) | ECS + EKS |
+| `DOMAIN_NAME` | Your domain — baked into frontend as `VITE_API_URL` | ECS + EKS |
+| `ACM_CERT_ARN` | ACM certificate ARN for the ALB Ingress | EKS only |
+| `PROJECT_NAME` | Value of `project_name` in tfvars (e.g. `ecs-fullstack`) | EKS only |
 
 ---
 
-## Triggering the Pipeline
+## Deploying
 
-Push to `main`:
+### ECS (push to main)
 
 ```bash
 git push origin main
 ```
 
-The pipeline will:
-1. Build and push backend + frontend Docker images to ECR (parallel)
-2. Run `terraform plan` then `terraform apply` in the `dev` workspace
-3. Wait for ECS services to stabilize
+The `deploy.yml` pipeline will:
+1. Build and push backend + frontend images to ECR (parallel)
+2. `terraform plan` + `terraform apply` in the `dev` workspace
+3. Wait for ECS services to stabilize (`aws ecs wait services-stable`)
 
-To deploy to prod, trigger the workflow manually (Actions → "Build & Deploy" → Run workflow) and select workspace `prod`.
+### EKS (manual trigger)
+
+Go to **Actions → Build & Deploy (EKS) → Run workflow**, select `dev` or `prod`.
+
+The `deploy-eks.yml` pipeline will:
+1. Build and push images (parallel)
+2. `terraform apply` with `TF_VAR_enable_eks=true`
+3. Helm install: AWS Load Balancer Controller, External Secrets Operator, metrics-server, Cluster Autoscaler
+4. Helm upgrade the `fullstack` chart
+5. `kubectl rollout status` for both deployments
 
 ---
 
@@ -176,31 +208,29 @@ terraform plan -var-file=terraform.prod.tfvars
 terraform apply -var-file=terraform.prod.tfvars
 ```
 
-Prod differences (auto-applied via workspace locals):
-- RDS: `db.t3.medium`, Multi-AZ enabled, deletion protection on
-- ECS: larger CPU/memory, min 2 tasks per service
-- Container Insights: enabled
+Prod differences (applied automatically via workspace locals):
+
+| | dev | prod |
+|---|---|---|
+| RDS instance | `db.t3.micro` | `db.t3.medium` + Multi-AZ |
+| ECS tasks | 512 CPU / 1024 MB, min 1 | 1024 CPU / 2048 MB, min 2 |
+| EKS nodes | 2× `t3.medium` SPOT | 3× `t3.large` ON_DEMAND (max 6) |
+| Container Insights | off | on |
+| RDS deletion protection | off | on |
 
 ---
 
 ## Verification
 
+### ECS
+
 ```bash
-ALB=$(terraform output -raw alb_dns_name)
+ALB=$(cd terraform && terraform output -raw alb_dns_name)
 
-# HTTP → HTTPS redirect
-curl -I "http://${ALB}"            # expect 301
+curl -I "http://${ALB}"                    # expect 301
+curl -sk "https://${ALB}/health"           # expect: ok
+curl -sk "https://${ALB}/api/v1/utils/health-check/"  # expect: {"status":"ok"}
 
-# Frontend
-curl -sk "https://${ALB}/"         # expect HTML
-
-# Frontend health
-curl -sk "https://${ALB}/health"   # expect: ok
-
-# Backend API health (via ALB path rule)
-curl -sk "https://${ALB}/api/health"  # expect: {"status":"ok"}
-
-# ECS service status
 aws ecs describe-services \
   --cluster $(terraform output -raw cluster_name) \
   --services \
@@ -209,21 +239,48 @@ aws ecs describe-services \
   --query 'services[*].{name:serviceName,desired:desiredCount,running:runningCount}'
 ```
 
+### EKS
+
+```bash
+aws eks update-kubeconfig \
+  --name $(cd terraform && terraform output -raw eks_cluster_name) \
+  --region us-east-1
+
+kubectl get nodes
+kubectl get pods -n fullstack
+kubectl get ingress -n fullstack       # shows ALB DNS
+kubectl get externalsecret -n fullstack  # should show READY=True
+```
+
 ---
 
 ## Teardown
 
+### ECS
+
 ```bash
 cd terraform
-
-# Dev (deletion_protection = false, no final snapshot)
 terraform workspace select dev
 terraform destroy -var-file=terraform.tfvars
-
-# Prod (requires disabling deletion protection first)
-terraform workspace select prod
-# Manually set deletion_protection=false in RDS console, then:
-terraform destroy -var-file=terraform.prod.tfvars
 ```
 
-> **Note**: ECR repositories have `force_delete` disabled by default. Empty them before destroy, or add `force_delete = true` to the ECR module for non-prod.
+### EKS
+
+```bash
+# Uninstall Helm releases first (removes ALB + target groups from AWS)
+helm uninstall fullstack              -n fullstack
+helm uninstall aws-load-balancer-controller -n kube-system
+helm uninstall external-secrets       -n external-secrets
+helm uninstall cluster-autoscaler     -n kube-system
+
+# Then destroy infra
+cd terraform
+terraform workspace select dev
+terraform destroy -var-file=terraform.tfvars
+```
+
+### Prod
+
+Prod has `deletion_protection = true` on RDS. Disable it in the AWS console first, then run `terraform destroy -var-file=terraform.prod.tfvars`.
+
+> **Note**: ECR repositories are not force-deleted by default. Empty them before destroy, or add `force_delete = true` to the ECR module for non-prod.

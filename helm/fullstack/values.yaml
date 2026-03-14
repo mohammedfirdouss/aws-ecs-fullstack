@@ -1,0 +1,65 @@
+# ── Namespace ─────────────────────────────────────────────────────────────────
+namespace: fullstack
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+aws:
+  region: us-east-1
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+# Names of the Secrets Manager secrets (not ARNs).
+secrets:
+  dbSecretName: "ecs-fullstack/db-credentials"
+  appSecretName: "ecs-fullstack/app-config"
+
+# ── External Secrets Operator service account ─────────────────────────────────
+# The ESO service account lives in the external-secrets namespace and is
+# annotated with the IRSA role ARN so pods can call Secrets Manager.
+eso:
+  serviceAccountName: external-secrets-sa
+  roleArn: ""  # set via --set or values override: eks_eso_role_arn tf output
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  certificateArn: ""  # ACM cert ARN — set from terraform output
+  host: ""            # e.g. example.com
+
+# ── Backend ───────────────────────────────────────────────────────────────────
+backend:
+  image:
+    repository: ""
+    tag: "latest"
+  replicaCount: 1
+  port: 8000
+  resources:
+    requests:
+      cpu: "256m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1024Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+  env:
+    ENVIRONMENT: production
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+frontend:
+  image:
+    repository: ""
+    tag: "latest"
+  replicaCount: 1
+  port: 80
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 2
+    targetCPUUtilizationPercentage: 70

@@ -1,0 +1,25 @@
+backend:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: "512m"
+      memory: "1024Mi"
+    limits:
+      cpu: "1000m"
+      memory: "2048Mi"
+  hpa:
+    minReplicas: 2
+    maxReplicas: 10
+
+frontend:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  hpa:
+    minReplicas: 2
+    maxReplicas: 6

@@ -1,0 +1,278 @@
+name: Build & Deploy (EKS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Terraform workspace (dev or prod)"
+        required: false
+        default: "dev"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  # ── Build backend ────────────────────────────────────────────────────────────
+  build-backend:
+    name: Build & Push Backend
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push
+        id: meta
+        env:
+          REGISTRY:   ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ secrets.BACKEND_ECR_REPO }}
+          IMAGE_TAG:  sha-${{ github.sha }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          docker build -t "${IMAGE_URI}" --file ./app/backend/Dockerfile ./app
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}"  >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"  >> "$GITHUB_OUTPUT"
+
+  # ── Build frontend ───────────────────────────────────────────────────────────
+  build-frontend:
+    name: Build & Push Frontend
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push
+        id: meta
+        env:
+          REGISTRY:   ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ secrets.FRONTEND_ECR_REPO }}
+          IMAGE_TAG:  sha-${{ github.sha }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          docker build \
+            --build-arg VITE_API_URL="https://api.${{ secrets.DOMAIN_NAME }}" \
+            --file ./app/frontend/Dockerfile \
+            --tag "${IMAGE_URI}" \
+            ./app
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}"  >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"  >> "$GITHUB_OUTPUT"
+
+  # ── Terraform: provision EKS cluster ─────────────────────────────────────────
+  terraform:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend]
+    outputs:
+      cluster_name:       ${{ steps.tf.outputs.cluster_name }}
+      lbc_role_arn:       ${{ steps.tf.outputs.lbc_role_arn }}
+      eso_role_arn:       ${{ steps.tf.outputs.eso_role_arn }}
+      autoscaler_role_arn: ${{ steps.tf.outputs.autoscaler_role_arn }}
+      acm_cert_arn:       ${{ steps.tf.outputs.acm_cert_arn }}
+      backend_ecr_url:    ${{ steps.tf.outputs.backend_ecr_url }}
+      frontend_ecr_url:   ${{ steps.tf.outputs.frontend_ecr_url }}
+
+    env:
+      TF_VAR_backend_image:  ${{ needs.build-backend.outputs.image_uri }}
+      TF_VAR_frontend_image: ${{ needs.build-frontend.outputs.image_uri }}
+      TF_VAR_enable_eks:     "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_BACKEND_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_BACKEND_DYNAMODB_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Select / create workspace
+        working-directory: terraform
+        env:
+          TF_WORKSPACE: ${{ github.event.inputs.workspace || 'dev' }}
+        run: |
+          terraform workspace select "${TF_WORKSPACE}" \
+            || terraform workspace new "${TF_WORKSPACE}"
+
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          TF_WORKSPACE: ${{ github.event.inputs.workspace || 'dev' }}
+        run: |
+          TFVARS_FILE="terraform.tfvars"
+          [[ "${TF_WORKSPACE}" == "prod" ]] && TFVARS_FILE="terraform.prod.tfvars"
+          terraform plan -var-file="${TFVARS_FILE}" -out=tfplan
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture outputs
+        id: tf
+        working-directory: terraform
+        run: |
+          echo "cluster_name=$(terraform output -raw eks_cluster_name)"             >> "$GITHUB_OUTPUT"
+          echo "lbc_role_arn=$(terraform output -raw eks_lbc_role_arn)"             >> "$GITHUB_OUTPUT"
+          echo "eso_role_arn=$(terraform output -raw eks_eso_role_arn)"             >> "$GITHUB_OUTPUT"
+          echo "autoscaler_role_arn=$(terraform output -raw eks_autoscaler_role_arn)" >> "$GITHUB_OUTPUT"
+          echo "backend_ecr_url=$(terraform output -raw backend_ecr_url)"           >> "$GITHUB_OUTPUT"
+          echo "frontend_ecr_url=$(terraform output -raw frontend_ecr_url)"         >> "$GITHUB_OUTPUT"
+
+  # ── Helm: install cluster add-ons ────────────────────────────────────────────
+  deploy-addons:
+    name: Deploy Cluster Add-ons
+    runs-on: ubuntu-latest
+    needs: terraform
+    env:
+      CLUSTER_NAME: ${{ needs.terraform.outputs.cluster_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Install AWS Load Balancer Controller
+        env:
+          LBC_ROLE_ARN: ${{ needs.terraform.outputs.lbc_role_arn }}
+        run: |
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --create-namespace \
+            --wait --timeout 5m \
+            --set clusterName="${{ env.CLUSTER_NAME }}" \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${LBC_ROLE_ARN}"
+
+      - name: Install External Secrets Operator
+        env:
+          ESO_ROLE_ARN: ${{ needs.terraform.outputs.eso_role_arn }}
+        run: |
+          helm repo add external-secrets https://charts.external-secrets.io
+          helm repo update
+          helm upgrade --install external-secrets external-secrets/external-secrets \
+            --namespace external-secrets \
+            --create-namespace \
+            --wait --timeout 5m \
+            --set installCRDs=true
+
+      - name: Install metrics-server
+        run: |
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+          helm repo update
+          helm upgrade --install metrics-server metrics-server/metrics-server \
+            --namespace kube-system \
+            --wait --timeout 3m
+
+      - name: Install Cluster Autoscaler
+        env:
+          AUTOSCALER_ROLE_ARN: ${{ needs.terraform.outputs.autoscaler_role_arn }}
+        run: |
+          helm repo add autoscaler https://kubernetes.github.io/autoscaler
+          helm repo update
+          helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+            --namespace kube-system \
+            --wait --timeout 5m \
+            --set autoDiscovery.clusterName="${{ env.CLUSTER_NAME }}" \
+            --set awsRegion="${{ env.AWS_REGION }}" \
+            --set rbac.serviceAccount.create=true \
+            --set rbac.serviceAccount.name=cluster-autoscaler \
+            --set "rbac.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${AUTOSCALER_ROLE_ARN}"
+
+  # ── Helm: deploy application ──────────────────────────────────────────────────
+  deploy-app:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend, terraform, deploy-addons]
+    env:
+      CLUSTER_NAME: ${{ needs.terraform.outputs.cluster_name }}
+      WORKSPACE:    ${{ github.event.inputs.workspace || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+
+      - name: Deploy fullstack chart
+        env:
+          BACKEND_TAG:  ${{ needs.build-backend.outputs.image_tag }}
+          FRONTEND_TAG: ${{ needs.build-frontend.outputs.image_tag }}
+          ESO_ROLE_ARN: ${{ needs.terraform.outputs.eso_role_arn }}
+          BACKEND_REPO: ${{ needs.terraform.outputs.backend_ecr_url }}
+          FRONTEND_REPO: ${{ needs.terraform.outputs.frontend_ecr_url }}
+        run: |
+          VALUES_FILE="helm/fullstack/values.dev.yaml"
+          [[ "${WORKSPACE}" == "prod" ]] && VALUES_FILE="helm/fullstack/values.prod.yaml"
+
+          helm upgrade --install fullstack ./helm/fullstack \
+            --namespace fullstack \
+            --create-namespace \
+            --wait --timeout 10m \
+            --values "${VALUES_FILE}" \
+            --set aws.region="${{ env.AWS_REGION }}" \
+            --set eso.roleArn="${ESO_ROLE_ARN}" \
+            --set ingress.certificateArn="${{ secrets.ACM_CERT_ARN }}" \
+            --set ingress.host="${{ secrets.DOMAIN_NAME }}" \
+            --set backend.image.repository="${BACKEND_REPO}" \
+            --set backend.image.tag="${BACKEND_TAG}" \
+            --set frontend.image.repository="${FRONTEND_REPO}" \
+            --set frontend.image.tag="${FRONTEND_TAG}" \
+            --set secrets.dbSecretName="${{ secrets.PROJECT_NAME }}/db-credentials" \
+            --set secrets.appSecretName="${{ secrets.PROJECT_NAME }}/app-config"
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/backend  -n fullstack --timeout=5m
+          kubectl rollout status deployment/frontend -n fullstack --timeout=5m
