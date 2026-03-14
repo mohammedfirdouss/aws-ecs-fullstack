@@ -67,3 +67,15 @@ variable "first_superuser_password" {
   type        = string
   sensitive   = true
 }
+
+variable "enable_eks" {
+  description = "Provision an EKS cluster alongside (or instead of) ECS."
+  type        = bool
+  default     = false
+}
+
+variable "kubernetes_version" {
+  description = "EKS Kubernetes version."
+  type        = string
+  default     = "1.31"
+}

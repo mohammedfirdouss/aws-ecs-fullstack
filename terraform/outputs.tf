@@ -43,3 +43,33 @@ output "vpc_id" {
   description = "VPC ID."
   value       = module.networking.vpc_id
 }
+
+output "eks_cluster_name" {
+  description = "EKS cluster name (empty if enable_eks = false)."
+  value       = var.enable_eks ? module.eks[0].cluster_name : ""
+}
+
+output "eks_cluster_endpoint" {
+  description = "EKS API server endpoint."
+  value       = var.enable_eks ? module.eks[0].cluster_endpoint : ""
+}
+
+output "eks_lbc_role_arn" {
+  description = "IAM role ARN for the AWS Load Balancer Controller."
+  value       = var.enable_eks ? module.eks[0].lbc_role_arn : ""
+}
+
+output "eks_eso_role_arn" {
+  description = "IAM role ARN for the External Secrets Operator."
+  value       = var.enable_eks ? module.eks[0].eso_role_arn : ""
+}
+
+output "eks_autoscaler_role_arn" {
+  description = "IAM role ARN for the Cluster Autoscaler."
+  value       = var.enable_eks ? module.eks[0].autoscaler_role_arn : ""
+}
+
+output "eks_oidc_provider_arn" {
+  description = "OIDC provider ARN for IRSA."
+  value       = var.enable_eks ? module.eks[0].cluster_oidc_provider_arn : ""
+}

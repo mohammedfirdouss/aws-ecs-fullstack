@@ -25,6 +25,13 @@ locals {
   backend_max_capacity  = local.is_prod ? 10 : 3
   frontend_min_capacity = local.is_prod ? 2 : 1
   frontend_max_capacity = local.is_prod ? 6 : 2
+
+  # EKS node sizing per workspace
+  eks_node_instance_types = local.is_prod ? ["t3.large"] : ["t3.medium"]
+  eks_node_capacity_type  = local.is_prod ? "ON_DEMAND" : "SPOT"
+  eks_node_desired        = local.is_prod ? 3 : 2
+  eks_node_min            = local.is_prod ? 2 : 2
+  eks_node_max            = local.is_prod ? 6 : 4
 }
 
 module "networking" {
@@ -150,6 +157,27 @@ module "ecs" {
   aws_region             = var.aws_region
 }
 
+
+# ── EKS ──────────────────────────────────────────────────────────────────────
+
+module "eks" {
+  count  = var.enable_eks ? 1 : 0
+  source = "./modules/eks"
+
+  project_name        = var.project_name
+  vpc_id              = module.networking.vpc_id
+  private_subnet_ids  = module.networking.private_subnet_ids
+  public_subnet_ids   = module.networking.public_subnet_ids
+  kubernetes_version  = var.kubernetes_version
+  node_instance_types = local.eks_node_instance_types
+  node_capacity_type  = local.eks_node_capacity_type
+  node_desired_size   = local.eks_node_desired
+  node_min_size       = local.eks_node_min
+  node_max_size       = local.eks_node_max
+  secret_arns         = [local.db_secret_arn_pattern, local.app_secret_arn_pattern]
+}
+
+# ── Observability ─────────────────────────────────────────────────────────────
 
 module "observability" {
   source = "./modules/observability"

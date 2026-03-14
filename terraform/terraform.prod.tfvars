@@ -12,3 +12,6 @@ container_insights_enabled = true
 
 first_superuser          = "admin@yourdomain.com"
 first_superuser_password = "REPLACE_WITH_STRONG_PASSWORD"
+
+enable_eks         = true
+kubernetes_version = "1.31"

@@ -11,4 +11,7 @@ create_github_oidc_provider = true
 container_insights_enabled = false
 
 first_superuser          = "admin@example.com"
-first_superuser_password = "changethis"   # 
+first_superuser_password = "changethis"
+
+enable_eks         = false
+kubernetes_version = "1.31"
