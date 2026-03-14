@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "fullstack.labels" . | nindent 4 }}
+    {{- include "fullstack.backend.selectorLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.backend.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fullstack.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fullstack.backend.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.backend.port }}
+              protocol: TCP
+          # DB credentials injected from the ESO-synced K8s secret
+          envFrom:
+            - secretRef:
+                name: db-credentials
+            - secretRef:
+                name: app-config
+          env:
+            - name: ENVIRONMENT
+              value: {{ .Values.backend.env.ENVIRONMENT | quote }}
+            {{- if .Values.ingress.host }}
+            - name: DOMAIN
+              value: {{ .Values.ingress.host | quote }}
+            - name: BACKEND_CORS_ORIGINS
+              value: "https://{{ .Values.ingress.host }}"
+            - name: FRONTEND_HOST
+              value: "https://{{ .Values.ingress.host }}"
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /api/v1/utils/health-check/
+              port: {{ .Values.backend.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/utils/health-check/
+              port: {{ .Values.backend.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+      terminationGracePeriodSeconds: 30
